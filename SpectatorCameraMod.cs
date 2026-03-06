@@ -1,174 +1,96 @@
 using BepInEx;
 using BepInEx.Configuration;
-using HarmonyLib;
 using UnityEngine;
-using Mirror;
 using System.Linq;
-using System.Collections.Generic;
-using UnityEngine.SceneManagement;
+using Mirror;
 
 namespace SpectatorCamera
 {
-    [BepInPlugin("com.kingcox22.sbg.autospectator", "Auto Spectator", "1.1.1")]
+    [BepInPlugin("com.kingcox22.sbg.autospectator", "Auto Spectator", "1.3.4")]
     public class SpectatorCameraPlugin : BaseUnityPlugin
     {
-        private static ConfigEntry<float> _configSpecInterval;
         private float _specTimer = 0f;
-        private Transform _cachedHole;
-        private OrbitCameraModule _cachedOrbit;
-        private bool _isCustomSpectatorActive = false;
-        private string _lastScene = "";
+        
+        // Config Entry
+        private ConfigEntry<float> _configUpdateInterval;
 
         private void Awake()
         {
-            _configSpecInterval = Config.Bind("Spectator", "Update Interval", 3f, "Seconds between camera updates."); 
+            // Bind the config variable
+            _configUpdateInterval = Config.Bind("Spectator", 
+                                                "Update Interval", 
+                                                3f, 
+                                                "Seconds between camera updates.");
 
-            // Keep your event hooks
-            PlayerSpectator.LocalPlayerIsSpectatingChanged += OnGameSpectateChanged; 
-            PlayerSpectator.LocalPlayerStoppedSpectating += OnGameSpectateStopped; 
-
-            var harmony = new Harmony("com.kingcox22.sbg.autospectator");
-            harmony.PatchAll();
-            
-            Logger.LogInfo("Auto Spectator Loaded. Watching for Round Ends...");
+            Logger.LogInfo("Auto Spectator 1.3.4 (Cinematic View) Loaded.");
         }
 
         private void Update()
         {
-            // --- NEW: END OF ROUND RESET TRIGGERS ---
-            
-            // 1. Reset if we enter the Driving Range or Lobby
-            string currentScene = SceneManager.GetActiveScene().name;
-            if (currentScene != _lastScene)
-            {
-                if (currentScene.Contains("DrivingRange") || currentScene.Contains("Lobby"))
-                {
-                    OnGameSpectateStopped();
-                }
-                _lastScene = currentScene;
-            }
-
-            // 2. Reset if a new Hole Overview starts
-            if (HoleOverviewCameraUi.HasInstance && HoleOverviewCameraUi.Instance.NetworkisVisible)
-            {
-                if (_isCustomSpectatorActive) OnGameSpectateStopped();
-            }
-
-            // --- END RESET TRIGGERS ---
-
+            // Only process logic if we are actually in a networked match
             if (!NetworkClient.active) return;
 
             _specTimer += Time.deltaTime;
-            if (_specTimer >= _configSpecInterval.Value)
+            
+            // Use the config value for the timer check
+            if (_specTimer >= _configUpdateInterval.Value)
             {
                 _specTimer = 0f;
-                
-                // Safety: If the event failed to fire, poll the state manually
-                CheckSpectatorStateManually();
-                
-                RefreshSpectatorLogic();
+                MatchLeaderOfficially();
             }
         }
 
-        private void CheckSpectatorStateManually()
+        private void MatchLeaderOfficially()
         {
             var lp = GameManager.LocalPlayerInfo;
-            if (lp != null && lp.AsSpectator != null)
-            {
-                _isCustomSpectatorActive = lp.AsSpectator.IsSpectating;
-            }
-        }
+            if (lp == null || lp.AsSpectator == null || !lp.AsSpectator.IsSpectating) return;
 
-        private void OnGameSpectateChanged()  
-        {
-            var lp = GameManager.LocalPlayerInfo;
-            if (lp != null && lp.AsSpectator != null)
-            {
-                _isCustomSpectatorActive = lp.AsSpectator.IsSpectating;
-            }
-        }
+            var spectator = lp.AsSpectator;
+            
+            // Search for the 'course' hole/flag location
+            Transform holeTrans = GolfHoleManager.MainHole?.transform;
+            if (holeTrans == null) return;
 
-        private void OnGameSpectateStopped()
-        {
-            Logger.LogInfo("Round end or Manual Stop detected. Resetting camera to player.");
-            _isCustomSpectatorActive = false;
-            ResetCamera();
-        }
-
-        private void ResetCamera()
-        {
-            if (_cachedOrbit == null) _cachedOrbit = GameObject.FindFirstObjectByType<OrbitCameraModule>();
-            if (_cachedOrbit != null)
-            {
-                var localGolfer = GameObject.FindObjectsByType<PlayerGolfer>(FindObjectsSortMode.None)
-                    .FirstOrDefault(g => g.isLocalPlayer);
-                
-                if (localGolfer != null)
-                {
-                    _cachedOrbit.subject = localGolfer.transform;
-                }
-            }
-            _cachedHole = null;
-        }
-
-        private void RefreshSpectatorLogic()
-        {
-            // 1. Guard Clause: Don't run if the feature is toggled off
-            if (!_isCustomSpectatorActive) return;
-
-            // 2. Resolve Hole Location using the Game's Internal Singleton
-            // We check MainHole directly. If the level is loading or no hole is set, this returns null.
-            if (GolfHoleManager.MainHole != null)
-            {
-                _cachedHole = GolfHoleManager.MainHole.transform;
-            }
-            else
-            {
-                // Fallback: If manager is empty, try a quick Type search or just wait for the next frame
-                var fallbackHole = GameObject.FindFirstObjectByType<GolfHole>();
-                _cachedHole = fallbackHole?.transform;
-            }
-
-            // 3. Resolve Camera Module
-            if (_cachedOrbit == null) 
-            {
-                _cachedOrbit = GameObject.FindFirstObjectByType<OrbitCameraModule>();
-            }
-
-            // 4. Safety Check: If we still don't have a hole or a camera, we can't do math
-            if (_cachedHole == null || _cachedOrbit == null) return;
-
-            // 5. Gather all other golfers (excluding the local player)
-            var golfers = GameObject.FindObjectsByType<PlayerGolfer>(FindObjectsSortMode.None)
+            // Find the closest golfer to the flag
+            var leader = Object.FindObjectsOfType<PlayerGolfer>()
                 .Where(g => g != null && !g.isLocalPlayer && g.gameObject.activeInHierarchy)
-                .ToList();
-
-            if (golfers.Count == 0) return;
-
-            // 6. Find the Leader (The golfer closest to the GolfHoleManager.MainHole)
-            var leader = golfers
-                .OrderBy(g => Vector3.Distance(g.transform.position, _cachedHole.position))
+                .OrderBy(g => Vector3.Distance(g.transform.position, holeTrans.position))
                 .FirstOrDefault();
 
-            // 7. Update Camera Subject
-            // Only update if the subject has actually changed to prevent camera jitter
-            if (leader != null && _cachedOrbit.subject != leader.transform) 
+            if (leader == null) return;
+            PlayerInfo leaderInfo = leader.GetComponent<PlayerInfo>();
+
+            // Official Cycle: Step through targets until the game's internal state matches the leader
+            int safetyBreak = 0;
+            while (spectator.TargetPlayer != leaderInfo && safetyBreak < 20)
             {
-                _cachedOrbit.subject = leader.transform;
+                spectator.CycleNextTarget(false);
+                safetyBreak++;
             }
         }
 
         private void LateUpdate()
         {
-            if (!_isCustomSpectatorActive || _cachedHole == null || _cachedOrbit == null || _cachedOrbit.subject == null) return;
+            var lp = GameManager.LocalPlayerInfo;
+            if (lp == null || lp.AsSpectator == null || !lp.AsSpectator.IsSpectating) return;
 
-            Transform player = _cachedOrbit.subject;
-            Vector3 lookDir = (player.position - _cachedHole.position).normalized;
-            lookDir.y = 0;
+            Transform playerTransform = lp.AsSpectator.Target; 
+            Transform holeTransform = GolfHoleManager.MainHole?.transform;
 
-            // Positioning logic
-            _cachedOrbit.transform.position = player.position + (lookDir * 8.5f) + (Vector3.up * 4.5f);
-            _cachedOrbit.transform.LookAt(_cachedHole.position + (Vector3.up * 1.5f));
+            if (playerTransform == null || holeTransform == null) return;
+
+            if (CameraModuleController.TryGetOrbitModule(out var orbitModule))
+            {
+                // 1. HORIZONTAL SYNC (The "Flipped" fix)
+                Vector3 playerToHole = (holeTransform.position - playerTransform.position).normalized;
+                float targetYaw = Mathf.Atan2(playerToHole.x, playerToHole.z) * Mathf.Rad2Deg;
+                orbitModule.SetYaw(targetYaw);
+
+                // 2. VERTICAL LOCK (The "Y Direction" fix)
+                // 0 is level with the horizon, 90 is looking straight down.
+                // 15f gives a nice slight downward tilt.
+                orbitModule.SetPitch(15f); 
+            }
         }
     }
 }
